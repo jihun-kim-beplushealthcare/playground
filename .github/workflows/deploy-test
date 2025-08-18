@@ -1,0 +1,84 @@
+name: Rollback Tag Dry-Run (no AWS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "explicit=입력 태그 사용, previous=이전 태그 자동 선택"
+        type: choice
+        required: true
+        options: [explicit, previous]
+      tag:
+        description: "mode=explicit일 때 사용할 태그 (예: v1.2.3)"
+        required: false
+      active_tag:
+        description: "현재 활성 태그 (previous 시뮬레이션용)"
+        required: false
+        default: "v1.1.0"
+      releases:
+        description: "가용 태그 목록(쉼표 구분) — previous 시뮬레이션용"
+        required: false
+        default: "v1.0.0,v1.1.0,v1.2.0"
+
+jobs:
+  dry_run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
+
+      - name: Pick target tag (no AWS)
+        id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.mode }}"
+          INPUT_TAG="${{ inputs.tag }}"
+          ACTIVE="${{ inputs.active_tag }}"
+          RELEASES_RAW="${{ inputs.releases }}"
+
+          # 쉼표 구분 목록을 배열로 파싱
+          IFS=',' read -ra ARR <<< "$RELEASES_RAW"
+
+          if [[ "$MODE" == "explicit" ]]; then
+            if [[ -z "${INPUT_TAG:-}" ]]; then
+              echo "❌ mode=explicit 이면 tag 입력이 필요합니다." >&2
+              exit 1
+            fi
+            TARGET="$INPUT_TAG"
+          else
+            TARGET=""
+            # 단순 시뮬: releases에서 active와 다른 첫 항목을 이전 태그로 간주
+            for t in "${ARR[@]}"; do
+              trimmed="$(echo "$t" | xargs)"  # 앞뒤 공백 제거
+              if [[ "$trimmed" != "$ACTIVE" ]]; then
+                TARGET="$trimmed"
+                break
+              fi
+            done
+            if [[ -z "$TARGET" ]]; then
+              echo "❌ previous 모드에서 이전 태그를 찾지 못했습니다." >&2
+              exit 1
+            fi
+          fi
+
+          echo "target_tag=$TARGET" >> "$GITHUB_OUTPUT"
+
+          # Step Summary에 보기 좋게 출력
+          {
+            echo "## 🔎 Rollback Tag Dry-Run"
+            echo ""
+            echo "| 항목 | 값 |"
+            echo "|---|---|"
+            echo "| 모드 | $MODE |"
+            echo "| Active 태그 | $ACTIVE |"
+            echo "| Releases | $RELEASES_RAW |"
+            echo "| **선택된 태그** | **$TARGET** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 로그에도 눈에 띄게 표시
+          echo "::notice title=Selected tag::$TARGET"
+
+      - name: Show result
+        run: |
+          echo "Selected tag (output) = ${{ steps.pick.outputs.target_tag }}"
