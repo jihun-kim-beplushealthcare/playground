@@ -1,84 +1,220 @@
-name: Rollback Tag Dry-Run (no AWS)
+name: Rollback static site (S3 + CloudFront)
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "explicit=입력 태그 사용, previous=이전 태그 자동 선택"
+        description: "롤백 대상 선택"
         type: choice
         required: true
-        options: [explicit, previous]
+        options:
+          - explicit # 입력한 태그로 전환
+          - previous # 현재 활성 버전의 직전 태그로 전환
       tag:
-        description: "mode=explicit일 때 사용할 태그 (예: v1.2.3)"
+        description: "mode=explicit 일 때 /releases/<여기> 로 전환 (예: v1.2.3)"
         required: false
-      active_tag:
-        description: "현재 활성 태그 (previous 시뮬레이션용)"
-        required: false
-        default: "v1.1.0"
-      releases:
-        description: "가용 태그 목록(쉼표 구분) — previous 시뮬레이션용"
-        required: false
-        default: "v1.0.0,v1.1.0,v1.2.0"
+      invalidate_html:
+        description: "index.html 캐시 무효화 수행"
+        type: boolean
+        default: true
+        required: true
+      dry_run:
+        description: "설정 변경 없이 검증만 수행"
+        type: boolean
+        default: false
+        required: true
+      bump_version:
+        description: "브랜치 규칙에 따라 package.json 버전 자동 증가"
+        type: boolean
+        default: false
+        required: true
+      tag_release:
+        description: "버전 증가 시 git 태그까지 생성/푸시"
+        type: boolean
+        default: false
+        required: true
+
+permissions:
+  id-token: write
+  contents: write # ⬅️ 버전 커밋/푸시 위해 write 로 변경
+
+env:
+  AWS_REGION: ap-northeast-2
+  S3_BUCKET: your-s3-bucket-name # 🔁 바꾸세요
+  RELEASES_PREFIX: releases/
+  CLOUDFRONT_DISTRIBUTION_ID: E123ABCDEF0123 # 🔁 바꾸세요
+  CLOUDFRONT_ORIGIN_ID: s3-origin # 🔁 Origins.items[].Id
+  AWS_ACCOUNT_ID: "123456789012" # 🔁 바꾸세요
+  AWS_ROLE_NAME: "github-actions-oidc-role" # 🔁 바꾸세요
 
 jobs:
-  dry_run:
+  rollback:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (optional)
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Pick target tag (no AWS)
+      # ---------- (옵션) 버전 자동 증가 블록 ----------
+      - name: Setup Node
+        if: ${{ inputs.bump_version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Pick bump type (main=major, develop/release=minor, else=patch)
+        if: ${{ inputs.bump_version }}
+        id: pick_bump
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          case "$BRANCH" in
+            main) BUMP="major" ;;
+            develop|release) BUMP="minor" ;;
+            *) BUMP="patch" ;;
+          esac
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      # (태그 없이) 버전만 올리고 수동 커밋/푸시
+      - name: Bump package.json (no tag)
+        if: ${{ inputs.bump_version && !inputs.tag_release }}
+        # working-directory: apps/your-app   # ⬅️ 모노레포면 경로 지정
+        run: |
+          npm version ${{ steps.pick_bump.outputs.bump }} --no-git-tag-version
+          echo "NEW_VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_ENV
+
+      - name: Commit & push version bump
+        if: ${{ inputs.bump_version && !inputs.tag_release }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json 2>/dev/null || true
+          git commit -m "chore(version): bump to v${NEW_VERSION} on ${{ steps.pick_bump.outputs.branch }} (${{ steps.pick_bump.outputs.bump }})" || exit 0
+          git push origin "HEAD:${{ github.ref_name }}"
+
+      # (태그 포함) npm version이 자동 커밋+태그를 만듭니다
+      - name: Bump & tag release
+        if: ${{ inputs.bump_version && inputs.tag_release }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          npm version ${{ steps.pick_bump.outputs.bump }} -m "chore(release): v%s"
+
+      - name: Push with tags
+        if: ${{ inputs.bump_version && inputs.tag_release }}
+        run: |
+          git push origin "HEAD:${{ github.ref_name }}" --follow-tags
+      # ---------- (옵션) 버전 자동 증가 블록 끝 ----------
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/${{ env.AWS_ROLE_NAME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install jq (awscli는 이미지에 기본 포함)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Read active CloudFront OriginPath
+        id: active
+        run: |
+          TMP=$(mktemp)
+          aws cloudfront get-distribution --id "${CLOUDFRONT_DISTRIBUTION_ID}" > "$TMP"
+          ACTIVE_ORIGIN_PATH=$(
+            jq -r --arg OID "${CLOUDFRONT_ORIGIN_ID}" \
+              '.Distribution.DistributionConfig.Origins.Items[]
+               | select(.Id == $OID).OriginPath' "$TMP"
+          )
+          echo "active_origin_path=${ACTIVE_ORIGIN_PATH}" >> "$GITHUB_OUTPUT"
+          echo "ℹ️ Active OriginPath: ${ACTIVE_ORIGIN_PATH}"
+
+      - name: Pick target tag
         id: pick
-        shell: bash
         run: |
           set -euo pipefail
           MODE="${{ inputs.mode }}"
           INPUT_TAG="${{ inputs.tag }}"
-          ACTIVE="${{ inputs.active_tag }}"
-          RELEASES_RAW="${{ inputs.releases }}"
+          ACTIVE_PATH="${{ steps.active.outputs.active_origin_path }}"
+          ACTIVE_TAG=$(echo "$ACTIVE_PATH" | awk -F'/' '{print $3}')
 
-          # 쉼표 구분 목록을 배열로 파싱
-          IFS=',' read -ra ARR <<< "$RELEASES_RAW"
-
-          if [[ "$MODE" == "explicit" ]]; then
-            if [[ -z "${INPUT_TAG:-}" ]]; then
-              echo "❌ mode=explicit 이면 tag 입력이 필요합니다." >&2
+          if [ "$MODE" = "explicit" ]; then
+            if [ -z "$INPUT_TAG" ]; then
+              echo "❌ mode=explicit 일 때는 tag 입력이 필요합니다." >&2
               exit 1
             fi
-            TARGET="$INPUT_TAG"
+            TARGET_TAG="$INPUT_TAG"
           else
-            TARGET=""
-            # 단순 시뮬: releases에서 active와 다른 첫 항목을 이전 태그로 간주
-            for t in "${ARR[@]}"; do
-              trimmed="$(echo "$t" | xargs)"  # 앞뒤 공백 제거
-              if [[ "$trimmed" != "$ACTIVE" ]]; then
-                TARGET="$trimmed"
+            LIST=$(aws s3 ls "s3://${S3_BUCKET}/${RELEASES_PREFIX}" | awk '{print $2}' | sed 's#/##')
+            if [ -z "$LIST" ]; then
+              echo "❌ releases/ 하위에 태그가 없습니다." >&2
+              exit 1
+            fi
+            TARGET_TAG=""
+            for rel in $(echo "$LIST" | sort -r); do
+              if [ "$rel" != "$ACTIVE_TAG" ]; then
+                TARGET_TAG="$rel"
                 break
               fi
             done
-            if [[ -z "$TARGET" ]]; then
-              echo "❌ previous 모드에서 이전 태그를 찾지 못했습니다." >&2
+            if [ -z "$TARGET_TAG" ]; then
+              echo "❌ 활성 태그 외의 이전 태그가 없습니다." >&2
               exit 1
             fi
           fi
 
-          echo "target_tag=$TARGET" >> "$GITHUB_OUTPUT"
+          if ! aws s3 ls "s3://${S3_BUCKET}/${RELEASES_PREFIX}${TARGET_TAG}/index.html" >/dev/null 2>&1; then
+            echo "❌ 대상 태그에 index.html 이 없습니다: s3://${S3_BUCKET}/${RELEASES_PREFIX}${TARGET_TAG}/index.html" >&2
+            exit 1
+          fi
 
-          # Step Summary에 보기 좋게 출력
-          {
-            echo "## 🔎 Rollback Tag Dry-Run"
-            echo ""
-            echo "| 항목 | 값 |"
-            echo "|---|---|"
-            echo "| 모드 | $MODE |"
-            echo "| Active 태그 | $ACTIVE |"
-            echo "| Releases | $RELEASES_RAW |"
-            echo "| **선택된 태그** | **$TARGET** |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "target_tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
+          echo "🎯 Target tag: ${TARGET_TAG}"
 
-          # 로그에도 눈에 띄게 표시
-          echo "::notice title=Selected tag::$TARGET"
-
-      - name: Show result
+      - name: Show planned change
         run: |
-          echo "Selected tag (output) = ${{ steps.pick.outputs.target_tag }}"
+          echo "현재 OriginPath: ${{ steps.active.outputs.active_origin_path }}"
+          echo "변경될 OriginPath: /${{ env.RELEASES_PREFIX }}${{ steps.pick.outputs.target_tag }}"
+
+      - name: Stop here (dry-run)
+        if: ${{ inputs.dry_run == true }}
+        run: echo "🟨 Dry-run 모드로 설정 변경 없이 종료합니다."
+
+      - name: Switch CloudFront OriginPath
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          set -euo pipefail
+          NEW_PATH="/${RELEASES_PREFIX}${{ steps.pick.outputs.target_tag }}"
+          TMPCFG=$(mktemp)
+          aws cloudfront get-distribution-config --id "${CLOUDFRONT_DISTRIBUTION_ID}" > "$TMPCFG"
+          ETAG=$(jq -r '.ETag' "$TMPCFG")
+          CFG=$(jq -r '.DistributionConfig' "$TMPCFG")
+
+          NEW_CFG=$(echo "$CFG" | jq --arg OID "${CLOUDFRONT_ORIGIN_ID}" --arg PATH "$NEW_PATH" '
+            .Origins.Items |= map(if .Id == $OID then .OriginPath = $PATH else . end)
+          ')
+          echo "$NEW_CFG" > distribution-config.json
+
+          aws cloudfront update-distribution \
+            --id "${CLOUDFRONT_DISTRIBUTION_ID}" \
+            --if-match "$ETAG" \
+            --distribution-config file://distribution-config.json
+
+          echo "✅ OriginPath switched to ${NEW_PATH}"
+
+      - name: Invalidate /index.html
+        if: ${{ inputs.dry_run == false && inputs.invalidate_html == true }}
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
+            --paths "/index.html"
+          echo "🧹 Created invalidation for /index.html"
+
+      - name: Summary
+        if: ${{ always() }}
+        run: |
+          echo "Active(before): ${{ steps.active.outputs.active_origin_path }}"
+          echo "Target tag    : ${{ steps.pick.outputs.target_tag }}"
+          echo "Dry-run       : ${{ inputs.dry_run }}"
+          echo "Invalidate    : ${{ inputs.invalidate_html }}"
+          echo "Bump version  : ${{ inputs.bump_version }}"
+          echo "Tag release   : ${{ inputs.tag_release }}"
