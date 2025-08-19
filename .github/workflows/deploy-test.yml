@@ -1,54 +1,23 @@
-name: Rollback static site (S3 + CloudFront)
+name: Bump package.json version
 
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "롤백 대상 선택"
-        type: choice
-        required: true
-        options:
-          - explicit # 입력한 태그로 전환
-          - previous # 현재 활성 버전의 직전 태그로 전환
-      tag:
-        description: "mode=explicit 일 때 /releases/<여기> 로 전환 (예: v1.2.3)"
+      package_path:
+        description: "package.json 이 있는 경로 (모노레포: packages/xxx 등)"
         required: false
-      invalidate_html:
-        description: "index.html 캐시 무효화 수행"
-        type: boolean
-        default: true
-        required: true
-      dry_run:
-        description: "설정 변경 없이 검증만 수행"
-        type: boolean
-        default: false
-        required: true
-      bump_version:
-        description: "브랜치 규칙에 따라 package.json 버전 자동 증가"
-        type: boolean
-        default: false
-        required: true
+        default: "."
       tag_release:
-        description: "버전 증가 시 git 태그까지 생성/푸시"
+        description: "버전 증가와 함께 git 태그까지 생성/푸시"
         type: boolean
-        default: false
         required: true
+        default: false
 
 permissions:
-  id-token: write
-  contents: write # ⬅️ 버전 커밋/푸시 위해 write 로 변경
-
-env:
-  AWS_REGION: ap-northeast-2
-  S3_BUCKET: your-s3-bucket-name # 🔁 바꾸세요
-  RELEASES_PREFIX: releases/
-  CLOUDFRONT_DISTRIBUTION_ID: E123ABCDEF0123 # 🔁 바꾸세요
-  CLOUDFRONT_ORIGIN_ID: s3-origin # 🔁 Origins.items[].Id
-  AWS_ACCOUNT_ID: "123456789012" # 🔁 바꾸세요
-  AWS_ROLE_NAME: "github-actions-oidc-role" # 🔁 바꾸세요
+  contents: write
 
 jobs:
-  rollback:
+  bump:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -56,16 +25,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ---------- (옵션) 버전 자동 증가 블록 ----------
       - name: Setup Node
-        if: ${{ inputs.bump_version }}
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Pick bump type (main=major, develop/release=minor, else=patch)
-        if: ${{ inputs.bump_version }}
-        id: pick_bump
+      # 브랜치 규칙: main=major, develop/release=minor, else=patch
+      - name: Pick bump type
+        id: pick
         run: |
           BRANCH="${{ github.ref_name }}"
           case "$BRANCH" in
@@ -76,41 +43,33 @@ jobs:
           echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
-      # (태그 없이) 버전만 올리고 수동 커밋/푸시
-      - name: Bump package.json (no tag)
-        if: ${{ inputs.bump_version && !inputs.tag_release }}
-        # working-directory: apps/your-app   # ⬅️ 모노레포면 경로 지정
+      # ----- (옵션1) 태그 없이 버전만 올리기 -----
+      - name: Bump (no tag)
+        if: ${{ inputs.tag_release == false }}
+        working-directory: ${{ inputs.package_path }}
         run: |
-          npm version ${{ steps.pick_bump.outputs.bump }} --no-git-tag-version
+          npm version ${{ steps.pick.outputs.bump }} --no-git-tag-version
           echo "NEW_VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_ENV
 
-      - name: Commit & push version bump
-        if: ${{ inputs.bump_version && !inputs.tag_release }}
+      - name: Commit & push
+        if: ${{ inputs.tag_release == false }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add package.json package-lock.json 2>/dev/null || true
-          git commit -m "chore(version): bump to v${NEW_VERSION} on ${{ steps.pick_bump.outputs.branch }} (${{ steps.pick_bump.outputs.bump }})" || exit 0
+          git add ${{ inputs.package_path }}/package.json ${{ inputs.package_path }}/package-lock.json 2>/dev/null || true
+          git commit -m "chore(version): bump to v${NEW_VERSION} on ${{ steps.pick.outputs.branch }} (${{ steps.pick.outputs.bump }})" || exit 0
           git push origin "HEAD:${{ github.ref_name }}"
 
-      # (태그 포함) npm version이 자동 커밋+태그를 만듭니다
-      - name: Bump & tag release
-        if: ${{ inputs.bump_version && inputs.tag_release }}
+      # ----- (옵션2) 태그까지 생성/푸시 (npm version이 자동 커밋+태그) -----
+      - name: Bump & tag
+        if: ${{ inputs.tag_release == true }}
+        working-directory: ${{ inputs.package_path }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          npm version ${{ steps.pick_bump.outputs.bump }} -m "chore(release): v%s"
+          npm version ${{ steps.pick.outputs.bump }} -m "chore(release): v%s"
 
       - name: Push with tags
-        if: ${{ inputs.bump_version && inputs.tag_release }}
+        if: ${{ inputs.tag_release == true }}
         run: |
           git push origin "HEAD:${{ github.ref_name }}" --follow-tags
-
-      - name: Show planned change
-        run: |
-          echo "현재 OriginPath: ${{ steps.active.outputs.active_origin_path }}"
-          echo "변경될 OriginPath: /${{ env.RELEASES_PREFIX }}${{ steps.pick.outputs.target_tag }}"
-
-      - name: Stop here (dry-run)
-        if: ${{ inputs.dry_run == true }}
-        run: echo "🟨 Dry-run 모드로 설정 변경 없이 종료합니다."
