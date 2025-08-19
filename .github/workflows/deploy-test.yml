@@ -7,11 +7,6 @@ on:
         description: "package.json 이 있는 경로 (모노레포: packages/xxx 등)"
         required: false
         default: "."
-      tag_release:
-        description: "버전 증가와 함께 git 태그까지 생성/푸시"
-        type: boolean
-        required: true
-        default: false
 
 permissions:
   contents: write
@@ -43,9 +38,7 @@ jobs:
           echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
-      # ----- (옵션1) 태그 없이 버전만 올리기 -----
-      - name: Bump (no tag)
-        if: ${{ inputs.tag_release == false }}
+      - name: Bump
         working-directory: ${{ inputs.package_path }}
         run: |
           npm version ${{ steps.pick.outputs.bump }} --no-git-tag-version
@@ -59,17 +52,3 @@ jobs:
           git add ${{ inputs.package_path }}/package.json ${{ inputs.package_path }}/package-lock.json 2>/dev/null || true
           git commit -m "chore(version): bump to v${NEW_VERSION} on ${{ steps.pick.outputs.branch }} (${{ steps.pick.outputs.bump }})" || exit 0
           git push origin "HEAD:${{ github.ref_name }}"
-
-      # ----- (옵션2) 태그까지 생성/푸시 (npm version이 자동 커밋+태그) -----
-      - name: Bump & tag
-        if: ${{ inputs.tag_release == true }}
-        working-directory: ${{ inputs.package_path }}
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          npm version ${{ steps.pick.outputs.bump }} -m "chore(release): v%s"
-
-      - name: Push with tags
-        if: ${{ inputs.tag_release == true }}
-        run: |
-          git push origin "HEAD:${{ github.ref_name }}" --follow-tags
