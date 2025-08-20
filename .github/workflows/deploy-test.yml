@@ -20,10 +20,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Node
+      - name: pnpm-setup
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8
+          run_install: false
+
+      - name: node-setup
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
+          cache: 'pnpm'
 
       # 브랜치 규칙: main=major, develop/release=minor, else=patch
       - name: Pick bump type
@@ -45,6 +52,115 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           npm version ${{ steps.pick.outputs.bump }} -m "chore(release): v%s"
 
+      # 의존성 설치
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          case "${{ steps.detect.outputs.pm }}" in
+            pnpm) corepack enable; pnpm install --frozen-lockfile ;;
+            yarn) corepack enable; yarn install --frozen-lockfile ;;
+            npm)  npm ci || npm install ;;
+          esac
+
+      - name: install pnpm dependencies
+        run: pnpm install
+
+      - name: react build
+        run: pnpm run build
+
+          # 산출물 폴더 감지 (dist 우선, 없으면 build)
+      - name: Pick output dir
+        id: outdir
+        run: |
+          set -euo pipefail
+          if [ -d "dist" ]; then OUT="dist"
+          elif [ -d "build" ]; then OUT="build"
+          else
+            echo "❌ dist 또는 build 폴더를 찾지 못했습니다." >&2
+            exit 1
+          fi
+          echo "out_dir=$OUT" >> "$GITHUB_OUTPUT"
+          echo "Using output dir: $OUT"
+
+        # zip/unzip 유틸
+      - name: Install zip tools
+        run: sudo apt-get update && sudo apt-get install -y zip unzip
+
+      - name: Write build metadata
+        run: |
+          set -euo pipefail
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          ISO_NOW="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          cat > "${{ steps.outdir.outputs.out_dir }}/build-info.json" <<EOF
+          { "version": "${NEW_VERSION}", "branch": "${{ steps.pick.outputs.branch }}", "commit": "${SHORT_SHA}", "builtAt": "${ISO_NOW}" }
+          EOF
+
+      # 빌드 메타데이터 주입(선택) → 압축물 안에서 버전/커밋 확인용
+      - name: Write build metadata
+        run: |
+          set -euo pipefail
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          ISO_NOW="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          cat > "${{ steps.outdir.outputs.out_dir }}/build-info.json" <<EOF
+          { "version": "${NEW_VERSION}", "branch": "${{ steps.pick.outputs.branch }}", "commit": "${SHORT_SHA}", "builtAt": "${ISO_NOW}" }
+          EOF
+
+      # ZIP 생성
+      - name: Create archive
+        id: zip
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          REPO="${{ github.event.repository.name }}"
+          BRANCH="${{ steps.pick.outputs.branch }}"
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          ARCHIVE_NAME="${REPO}-${BRANCH}-v${NEW_VERSION}-${SHORT_SHA}.zip"
+          ARCHIVE_PATH="artifacts/${ARCHIVE_NAME}"
+          (cd "${{ steps.outdir.outputs.out_dir }}" && zip -r "../${ARCHIVE_PATH}" . >/dev/null)
+          echo "archive_name=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "archive_path=${ARCHIVE_PATH}"   >> "$GITHUB_OUTPUT"
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+          echo "ARCHIVE_PATH=${ARCHIVE_PATH}" >> $GITHUB_ENV
+
+      # ZIP 무결성 검사 + 목록 일부 출력 + SHA256
+      - name: Verify archive & checksum
+        id: verify
+        run: |
+          set -euo pipefail
+          echo "== zip test =="
+          unzip -t "${ARCHIVE_PATH}"
+          echo "== zip list (top 50) =="
+          unzip -l "${ARCHIVE_PATH}" | head -n 50
+          sha256sum "${ARCHIVE_PATH}" | tee "${ARCHIVE_PATH}.sha256"
+          SIZE=$(stat -c%s "${ARCHIVE_PATH}")
+          echo "size_bytes=${SIZE}" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d' ' -f1 "${ARCHIVE_PATH}.sha256")" >> "$GITHUB_OUTPUT"
+
+      # 아티팩트 업로드 (ZIP + 체크섬)
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.zip.outputs.archive_name }}
+          path: |
+            ${{ steps.zip.outputs.archive_path }}
+            ${{ steps.zip.outputs.archive_path }}.sha256
+          compression-level: 0
+
       - name: Push with tags
         run: |
           git push origin "HEAD:${{ github.ref_name }}" --follow-tags
+
+       # 실행 요약
+      - name: Summary
+        run: |
+          {
+            echo "## ✅ Bump, Build, Zip Summary"
+            echo ""
+            echo "- **Branch**: ${{ steps.pick.outputs.branch }}"
+            echo "- **Bump**: ${{ steps.pick.outputs.bump }}"
+            echo "- **Version**: v${NEW_VERSION}"
+            echo "- **Output dir**: ${{ steps.outdir.outputs.out_dir }}"
+            echo "- **Archive**: ${{ steps.zip.outputs.archive_name }}"
+            echo "- **Size**: $(( ${{ steps.verify.outputs.size_bytes }} / 1024 )) KB"
+            echo "- **SHA256**: \`${{ steps.verify.outputs.sha256 }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
