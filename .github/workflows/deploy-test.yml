@@ -51,6 +51,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           npm version ${{ steps.pick.outputs.bump }} -m "chore(release): v%s"
+          echo "NEW_VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_ENV
 
       # 의존성 설치
       - name: Install dependencies
